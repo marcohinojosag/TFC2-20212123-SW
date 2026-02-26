@@ -141,55 +141,98 @@ static inline float unwrapDeltaPrevNowDeg(float aPrev, float aNow) {
   return d;
 }
 
-// ================== Captura ==================
-static const uint32_t SAMPLE_US  = 500UL;         //  500 us
-static const uint32_t CAPTURE_US = 5000000UL;     //  1.5 s
-static const size_t   MAX_SAMPLES = (CAPTURE_US / SAMPLE_US); // 3000
+// ================== MODOS Y TIMINGS ==================
+static const uint8_t MC_STOP = 0;
+static const uint8_t MC_FWD  = 1;
+static const uint8_t MC_REV  = 2;
 
+static const uint8_t CAP_CONST_FWD = 0;
+static const uint8_t CAP_PROGRAM_P = 1;
+
+// SOLO PARA MXX
+static const uint32_t SAMPLE_US_M  = 250UL;
+static const uint32_t CAPTURE_US_M = 2000000UL;   // 2 s
+
+// PARA P
+static const uint32_t SAMPLE_US_P  = 500UL;
+static const uint32_t CAPTURE_US_P = 5000000UL;   // 5 s
+
+// Buffers dimensionados al peor caso (P: 5s @ 500us = 10000)
+static const size_t MAX_SAMPLES = (CAPTURE_US_P / SAMPLE_US_P);
+
+// ================== Buffers ==================
 static uint16_t cs_mv_buf[MAX_SAMPLES];
 static uint16_t vm_adc_mv_buf[MAX_SAMPLES];
-static uint16_t ang_cdeg_buf[MAX_SAMPLES];   // ángulo en centi-deg (0..36000)
-static int32_t  omg_mrad_buf[MAX_SAMPLES];   // omega (magnitud) en mrad/s
+static uint16_t ang_cdeg_buf[MAX_SAMPLES];   // centi-deg (0..36000)
+static int32_t  omg_mrad_buf[MAX_SAMPLES];   // mrad/s (magnitud)
 
 static volatile bool g_abort = false;
 static bool g_capturing = false;
 
-// Driver helpers
-static inline void vnhForward() {
+// ================== Driver helpers ==================
+static inline void vnhForwardPins() {
   digitalWrite(SEL0, HIGH);
   digitalWrite(INA, HIGH);
   digitalWrite(INB, LOW);
 }
-static inline void vnhStop() {
-  pwmWriteTicks(0);
+static inline void vnhReversePins() {
+  digitalWrite(SEL0, HIGH);
+  digitalWrite(INA, LOW);
+  digitalWrite(INB, HIGH);
+}
+static inline void vnhCoastPins() {
   digitalWrite(INA, LOW);
   digitalWrite(INB, LOW);
 }
+static inline void vnhStop() {
+  pwmWriteTicks(0);
+  vnhCoastPins();
+}
 
-static void runCapture(uint8_t dutyPct) {
+static inline void applyMotorCmd(uint8_t cmd, uint8_t dutyPct,
+                                 uint8_t &lastCmd, uint16_t &lastTicks) {
+  uint16_t ticks = (cmd == MC_STOP) ? 0 : pctToTicks(dutyPct);
+
+  if (cmd != lastCmd) {
+    pwmWriteTicks(0);
+    delayMicroseconds(50);
+
+    if (cmd == MC_FWD)      vnhForwardPins();
+    else if (cmd == MC_REV) vnhReversePins();
+    else                   vnhCoastPins();
+
+    lastCmd = cmd;
+    lastTicks = 0;
+  }
+
+  if (ticks != lastTicks) {
+    pwmWriteTicks(ticks);
+    lastTicks = ticks;
+  }
+}
+
+// runCapture parametrizable en muestreo/duración
+static void runCapture(uint8_t dutyPct, uint8_t mode, uint32_t sample_us, uint32_t capture_us) {
   if (dutyPct > 100) dutyPct = 100;
 
   g_abort = false;
   g_capturing = true;
 
-  // Motor ON
-  vnhForward();
-  pwmWriteTicks(pctToTicks(dutyPct));
+  // max samples para este modo (no siempre 10000)
+  const size_t maxThis = (size_t)(capture_us / sample_us);
+  const size_t maxN = (maxThis < MAX_SAMPLES) ? maxThis : MAX_SAMPLES;
 
   // --- Filtros (IIR) ---
-  // Ajusta TAU si quieres más/menos suavizado
   const float TAU_XY  = 0.003f;  // 3 ms para X,Y
   const float TAU_OMG = 0.010f;  // 10 ms para omega
 
-  // Rechazo por magnitud de campo baja (autoescalado)
-  const float MAG2_ABS_MIN   = 200.0f * 200.0f; // mínimo absoluto
-  const float MAG2_REF_FRAC  = 0.05f;           // 5% del nivel inicial
+  // Rechazo por magnitud de campo baja
+  const float MAG2_ABS_MIN   = 200.0f * 200.0f;
+  const float MAG2_REF_FRAC  = 0.05f;
 
-  // Estado previo
   bool havePrev = false;
   float prevAngleDeg = 0.0f;
 
-  // Estado filtros
   bool haveXY = false;
   float xf = 0.0f, yf = 0.0f;
   float omegaFilt = 0.0f;
@@ -199,10 +242,16 @@ static void runCapture(uint8_t dutyPct) {
   uint32_t next = t0;
   uint32_t prevSampleUs = t0;
 
+  uint8_t  lastCmd   = MC_STOP;
+  uint16_t lastTicks = 0;
+
+  // Arranque: forward
+  applyMotorCmd(MC_FWD, dutyPct, lastCmd, lastTicks);
+
   size_t n = 0;
 
-  while (n < MAX_SAMPLES) {
-    // Abort rápido si llega 'S' o 'STOP'
+  while (n < maxN) {
+    // Abort rápido si llega 'S'
     while (Serial.available()) {
       char c = (char)Serial.read();
       if (c == 'S' || c == 's') g_abort = true;
@@ -210,19 +259,31 @@ static void runCapture(uint8_t dutyPct) {
     if (g_abort) break;
 
     uint32_t now = micros();
-    if ((now - t0) >= CAPTURE_US) break;
+    uint32_t elapsed = now - t0;
+    if (elapsed >= capture_us) break;
 
-    // Gate de tiempo
     if ((int32_t)(now - next) < 0) continue;
-    next += SAMPLE_US;
+    next += sample_us;
 
-    // dt real (para derivada y filtros)
-    uint32_t sampleUs = micros();
-    float dt_s = (sampleUs - prevSampleUs) * 1e-6f;
-    prevSampleUs = sampleUs;
+    // ====== Programa P (SIEMPRE sensa, incluso en STOP) ======
+    if (mode == CAP_PROGRAM_P) {
+      // 0-1s: FWD, 1-2s: STOP, 2-3s: REV, 3-5s: STOP
+      uint8_t desired =
+        (elapsed < 1000000UL) ? MC_FWD :
+        (elapsed < 2000000UL) ? MC_STOP :
+        (elapsed < 3000000UL) ? MC_REV :
+                                MC_STOP;
 
-    // Clamps por seguridad ante jitter raro
-    const float Ts = (float)SAMPLE_US * 1e-6f;
+      applyMotorCmd(desired, dutyPct, lastCmd, lastTicks);
+    } else {
+      applyMotorCmd(MC_FWD, dutyPct, lastCmd, lastTicks);
+    }
+
+    // dt real
+    float dt_s = (now - prevSampleUs) * 1e-6f;
+    prevSampleUs = now;
+
+    const float Ts = (float)sample_us * 1e-6f;
     if (dt_s < 0.2f * Ts) dt_s = Ts;
     if (dt_s > 5.0f * Ts) dt_s = Ts;
 
@@ -234,12 +295,12 @@ static void runCapture(uint8_t dutyPct) {
     int16_t x = (int16_t)tmagRead16(REG_X_CH_RESULT);
     int16_t y = (int16_t)tmagRead16(REG_Y_CH_RESULT);
 
-    // --- Filtro IIR en X,Y ---
+    // --- Filtro IIR X,Y ---
     float alphaXY = dt_s / (TAU_XY + dt_s);
     if (!haveXY) {
       xf = (float)x; yf = (float)y;
       haveXY = true;
-      mag2_ref = xf*xf + yf*yf;   // referencia inicial
+      mag2_ref = xf*xf + yf*yf;
       if (mag2_ref < MAG2_ABS_MIN) mag2_ref = MAG2_ABS_MIN;
     } else {
       xf += alphaXY * ((float)x - xf);
@@ -251,7 +312,7 @@ static void runCapture(uint8_t dutyPct) {
     if (mag2_min < MAG2_ABS_MIN) mag2_min = MAG2_ABS_MIN;
 
     // --- Ángulo + omega ---
-    float angleDeg = prevAngleDeg;   // por defecto mantener
+    float angleDeg = prevAngleDeg;
     float omegaRad_signed = 0.0f;
 
     if (mag2 >= mag2_min) {
@@ -259,22 +320,18 @@ static void runCapture(uint8_t dutyPct) {
 
       if (havePrev) {
         float ddeg = unwrapDeltaPrevNowDeg(prevAngleDeg, angleDeg);
-        omegaRad_signed = (ddeg * (3.1415926f / 180.0f)) / dt_s; // rad/s (con signo)
+        omegaRad_signed = (ddeg * (3.1415926f / 180.0f)) / dt_s;
       } else {
         havePrev = true;
       }
       prevAngleDeg = angleDeg;
     } else {
-      // Campo bajo => lectura poco confiable
       omegaRad_signed = 0.0f;
-      // angleDeg se mantiene como prevAngleDeg
     }
 
-    // --- Filtro IIR en omega ---
+    // --- Filtro IIR omega ---
     float alphaOmg = dt_s / (TAU_OMG + dt_s);
     omegaFilt += alphaOmg * (omegaRad_signed - omegaFilt);
-
-    // salida: magnitud
     float omegaOut = fabsf(omegaFilt);
 
     // --- Guarda ---
@@ -286,19 +343,18 @@ static void runCapture(uint8_t dutyPct) {
     if (acdeg > 36000) acdeg = 36000;
     ang_cdeg_buf[n] = (uint16_t)acdeg;
 
-    omg_mrad_buf[n] = (int32_t)lroundf(omegaOut * 1000.0f); // mrad/s
+    omg_mrad_buf[n] = (int32_t)lroundf(omegaOut * 1000.0f);
 
     n++;
   }
 
-  // Motor OFF
   vnhStop();
   g_capturing = false;
 
   // ===== Output SOLO matriz =====
   // idx t_us Vcs_mV I_est_mA Vadc_motor_mV Vmotor_mV angle_deg omega_rad_s
   for (size_t i = 0; i < n; i++) {
-    uint32_t t_us  = (uint32_t)(i * SAMPLE_US);
+    uint32_t t_us = (uint32_t)i * sample_us;
 
     uint16_t vcs_mV = cs_mv_buf[i];
     uint32_t i_mA   = mvToCurrent_mA(vcs_mV);
@@ -320,7 +376,7 @@ static void runCapture(uint8_t dutyPct) {
   }
 }
 
-// ================== Serial parser (solo MXX y S/STOP) ==================
+// ================== Serial parser (MXX, S/STOP y P) ==================
 static void handleLine(String s) {
   s.trim();
   if (!s.length()) return;
@@ -331,11 +387,17 @@ static void handleLine(String s) {
     return;
   }
 
-  // MXX: duty cycle (0..100)
+  // P: rutina 5s a 50% (500us)
+  if ((s == "P" || s == "p") && !g_capturing) {
+    runCapture(50, CAP_PROGRAM_P, SAMPLE_US_P, CAPTURE_US_P);
+    return;
+  }
+
+  // MXX: SOLO ESTE comando usa 250us y 2s
   if ((s[0] == 'M' || s[0] == 'm') && !g_capturing) {
     int pct = s.substring(1).toInt();
     pct = constrain(pct, 0, 100);
-    runCapture((uint8_t)pct);
+    runCapture((uint8_t)pct, CAP_CONST_FWD, SAMPLE_US_M, CAPTURE_US_M);
   }
 }
 
